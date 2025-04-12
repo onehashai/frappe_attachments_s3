@@ -99,6 +99,7 @@ override_doctype_class = {
 
 doc_events = {
     "File": {
+        "before_save": "frappe_s3_attachment.controller.transfer_file",
         "after_insert": "frappe_s3_attachment.controller.file_upload_to_s3",
         "on_trash": "frappe_s3_attachment.controller.delete_from_cloud"
     }
@@ -136,4 +137,3 @@ doc_events = {
 # override_whitelisted_methods = {
 # 	"frappe.desk.doctype.event.event.get_events": "frappe_s3_attachment.event.get_events"
 # }
-

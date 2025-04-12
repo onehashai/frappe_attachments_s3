@@ -236,6 +236,56 @@ def extract_key_and_file_name(file_url):
     return key, file_name
 
 @frappe.whitelist()
+def transfer_file(doc, method):
+    """
+    Transfer file from public to private and vice-versa
+    """
+    frappe.log_error("is doc new?", doc.is_new())
+    if doc.is_folder or doc.is_new():
+        return
+
+    path = doc.file_url
+    if path and path.startswith(("http://", "https://")) and doc.is_private != doc.get_db_value("is_private"):
+        if doc.doctype == "File" and not doc.attached_to_doctype:
+            parent_doctype = doc.doctype
+            parent_name = doc.name
+        else:
+            parent_doctype = doc.attached_to_doctype
+            parent_name = doc.attached_to_name
+
+        ignore_s3_upload_for_doctype = frappe.local.conf.get('ignore_s3_upload_for_doctype') or ['Data Import']
+        if parent_doctype not in ignore_s3_upload_for_doctype:
+            key,filename = s3_upload.upload_files_to_s3_with_key(
+                path, doc.file_name,
+                doc.is_private, parent_doctype,
+                parent_name
+            )
+            s3.delete_from_s3(doc.content_hash)
+
+            if doc.is_private:
+                method = "frappe_s3_attachment.controller.generate_file"
+                site_base_url = get_url()
+                file_url = """{0}/api/method/{1}?key={2}&file_name={3}""".format(site_base_url, method, key, filename)
+            else:
+                file_url = '{}/{}/{}'.format(
+                    s3_upload.S3_CLIENT.meta.endpoint_url,
+                    s3_upload.BUCKET,
+                    key
+                )
+            frappe.db.sql("""UPDATE `tabFile` SET file_url=%s, folder=%s,
+                old_parent=%s, content_hash=%s WHERE name=%s""", (
+                file_url, doc.folder, doc.old_parent, key, doc.name))
+
+            # From this PR, this code is unuseful
+            # https://github.com/zerodha/frappe-attachments-s3/pull/39
+            # if frappe.get_meta(parent_doctype).get('image_field'):
+            #     frappe.db.set_value(parent_doctype, parent_name, frappe.get_meta(
+            #         parent_doctype).get('image_field'), file_url)
+
+            frappe.db.commit()
+            doc.reload()
+
+@frappe.whitelist()
 def file_upload_to_s3(doc, method):
     """
     check and upload files to s3. the path check and
@@ -250,7 +300,7 @@ def file_upload_to_s3(doc, method):
             key, file_name = extract_key_and_file_name(path)
             signed_url_request = f"{site_base_url}/api/method/frappe_s3_attachment.controller.generate_signed_url?key={key}&file_name={file_name}"
             response = requests.get(signed_url_request)
-            
+
             if response.status_code == 200:
                 signed_url = response.json().get("message")
             else:
@@ -276,7 +326,7 @@ def file_upload_to_s3(doc, method):
             with open(file_path, "wb") as f:
                 for chunk in response.iter_content(chunk_size=1024):
                     f.write(chunk)
-            
+
             # Update path to local
             if not doc.is_private:
                 path = '/files/' + file_name
