@@ -108,13 +108,13 @@ class S3Operations(object):
             return final_key
 
     def upload_files_to_s3_with_key(
-            self, file_path, file_name, is_private, parent_doctype, parent_name
+            self, file, file_name, is_private, parent_doctype, parent_name, is_obj=False
     ):
         """
         Uploads a new file to S3.
         Strips the file extension to set the content_type in metadata.
         """
-        mime_type = magic.from_file(file_path, mime=True)
+        mime_type = magic.from_file(file, mime=True)
         # frappe.msgprint(file_name)
         # frappe.msgprint("File Name Before")
         file_name = file_name.encode('ascii', 'replace')
@@ -124,33 +124,27 @@ class S3Operations(object):
         key = self.key_generator(file_name, parent_doctype, parent_name)
         content_type = mime_type
         try:
-            if is_private:
-                self.S3_CLIENT.upload_file(
-                    file_path, self.BUCKET, key,
-                    ExtraArgs={
-                        "ContentType": content_type,
-                        "Metadata": {
-                            "ContentType": content_type,
-                            "file_name": file_name
-                        }
-                    }
-                )
-            else:
-                self.S3_CLIENT.upload_file(
-                    file_path, self.BUCKET, key,
-                    ExtraArgs={
-                        "ContentType": content_type,
-                        "ACL": 'public-read',
-                        "Metadata": {
-                            "ContentType": content_type,
-
-                        }
-                    }
-                )
-
+            self.upload_file_to_s3(file, file_name, is_private, key, content_type, is_obj)
         except boto3.exceptions.S3UploadFailedError:
             frappe.throw(frappe._("File Upload Failed. Please try again."))
         return key,file_name
+
+    def upload_file_to_s3(self, file, file_name, is_private, key, content_type, is_obj=False):
+        extra_args = {
+            "ContentType": content_type,
+            "Metadata": {
+                "ContentType": content_type,
+            },
+        }
+        if is_private:
+            extra_args["Metadata"]["file_name"] = file_name
+        else:
+            extra_args["ACL"] = "public-read"
+
+        if is_obj:
+            self.S3_CLIENT.upload_fileobj(file, self.BUCKET, key, ExtraArgs=extra_args)
+        else:
+            self.S3_CLIENT.upload_file(file, self.BUCKET, key, ExtraArgs=extra_args)
 
     def delete_from_s3(self, key):
         """Delete file from s3"""
@@ -236,6 +230,68 @@ def extract_key_and_file_name(file_url):
     return key, file_name
 
 @frappe.whitelist()
+def transfer_file(doc, method):
+    """
+    Transfer file from public to private and vice-versa
+    """
+    frappe.log_error("is doc new?", doc.is_new())
+    if doc.is_folder or doc.is_new():
+        return
+
+    path = doc.file_url
+    if path and path.startswith(("http://", "https://")) and doc.has_value_changed("is_private"):
+        signed_url = path
+        file_name = doc.file_name
+
+        if "frappe_s3_attachment.controller.generate_file" in path:
+            site_base_url = frappe.utils.get_url()
+            key, file_name = extract_key_and_file_name(path)
+            signed_url_request = f"{site_base_url}/api/method/frappe_s3_attachment.controller.generate_signed_url?key={key}&file_name={file_name}"
+            response = requests.get(signed_url_request)
+
+            if response.status_code == 200:
+                signed_url = response.json().get("message")
+            else:
+                frappe.throw(f"Failed to generate signed URL: {response.status_code}")
+
+        response = requests.get(signed_url)
+        if response.status_code == 200:
+            file = response.content
+            parent_doctype = doc.doctype
+            parent_name = doc.name
+
+            if doc.doctype == "File" and doc.attached_to_doctype:
+                parent_doctype = doc.attached_to_doctype
+                parent_name = doc.attached_to_name
+
+            ignore_s3_upload_for_doctype = frappe.local.conf.get('ignore_s3_upload_for_doctype') or ['Data Import']
+            if parent_doctype not in ignore_s3_upload_for_doctype:
+                s3_ops = S3Operations()
+                key,filename = s3_ops.upload_files_to_s3_with_key(
+                    file, doc.file_name,
+                    doc.is_private, parent_doctype,
+                    parent_name, True
+                )
+                s3_ops.delete_from_s3(doc.content_hash)
+
+                if doc.is_private:
+                    method = "frappe_s3_attachment.controller.generate_file"
+                    site_base_url = get_url()
+                    file_url = """{0}/api/method/{1}?key={2}&file_name={3}""".format(site_base_url, method, key, filename)
+                else:
+                    file_url = '{}/{}/{}'.format(
+                        s3_ops.S3_CLIENT.meta.endpoint_url,
+                        s3_ops.BUCKET,
+                        key
+                    )
+
+                doc.file_url = file_url
+                doc.content_hash = key
+        else:
+            frappe.throw(f"Failed to get file from {path} (Status: {response.status_code})")
+
+
+@frappe.whitelist()
 def file_upload_to_s3(doc, method):
     """
     check and upload files to s3. the path check and
@@ -250,7 +306,7 @@ def file_upload_to_s3(doc, method):
             key, file_name = extract_key_and_file_name(path)
             signed_url_request = f"{site_base_url}/api/method/frappe_s3_attachment.controller.generate_signed_url?key={key}&file_name={file_name}"
             response = requests.get(signed_url_request)
-            
+
             if response.status_code == 200:
                 signed_url = response.json().get("message")
             else:
@@ -276,7 +332,7 @@ def file_upload_to_s3(doc, method):
             with open(file_path, "wb") as f:
                 for chunk in response.iter_content(chunk_size=1024):
                     f.write(chunk)
-            
+
             # Update path to local
             if not doc.is_private:
                 path = '/files/' + file_name
