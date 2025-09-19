@@ -305,6 +305,7 @@ def file_upload_to_s3(doc, method):
     if doc.is_folder == True:
         return
     s3_upload = S3Operations()
+    s3_settings_doc = frappe.get_single('S3 File Attachment')
     path = doc.file_url
     if path and path.startswith(("http://", "https://")):
         if "frappe_s3_attachment.controller.generate_file" in path:
@@ -317,6 +318,8 @@ def file_upload_to_s3(doc, method):
                 signed_url = response.json().get("message")
             else:
                 frappe.throw(f"Failed to generate signed URL: {response.status_code}")
+        elif s3_settings_doc.get("download_file_from_link") == 0:
+            return
         else:
             signed_url = path
             file_name = doc.file_name

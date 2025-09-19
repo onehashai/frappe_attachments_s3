@@ -1,0 +1,2 @@
+[post_model_sync]
+frappe_s3_attachment.patches.v15_0.set_download_file_from_link_as_default
